@@ -1,4 +1,4 @@
- import express, { Request, Response } from 'express';
+ import express, { Request, Response, NextFunction } from 'express';
 import bodyParser from 'body-parser';
 import cors from 'cors';
 import axios from 'axios';
@@ -32,6 +32,66 @@ const log = (msg: string, meta?: any) => {
     ...meta
   }));
 };
+
+// ==============================
+// [NEW FEATURE] RATE LIMITER
+// ==============================
+const RATE_LIMIT_MAX = Number(process.env.RATE_LIMIT_MAX || 60);
+const RATE_WINDOW_MS = 60_000; // 1 menit
+
+interface RateLimitEntry {
+  count: number;
+  resetAt: number;
+}
+
+const rateLimitStore = new Map<string, RateLimitEntry>();
+
+// Cleanup expired entries every 5 minutes to prevent memory leaks
+setInterval(() => {
+  const now = Date.now();
+  for (const [ip, entry] of rateLimitStore.entries()) {
+    if (now > entry.resetAt) {
+      rateLimitStore.delete(ip);
+    }
+  }
+}, 5 * 60_000);
+
+function rateLimitMiddleware(req: Request, res: Response, next: NextFunction): void {
+  const ip = req.ip || req.socket.remoteAddress || 'unknown';
+  const now = Date.now();
+
+  let entry = rateLimitStore.get(ip);
+
+  // Reset window jika sudah expired
+  if (!entry || now > entry.resetAt) {
+    entry = { count: 0, resetAt: now + RATE_WINDOW_MS };
+    rateLimitStore.set(ip, entry);
+  }
+
+  entry.count++;
+
+  // Set standard rate limit response headers
+  res.setHeader('X-RateLimit-Limit', RATE_LIMIT_MAX);
+  res.setHeader('X-RateLimit-Remaining', Math.max(0, RATE_LIMIT_MAX - entry.count));
+  res.setHeader('X-RateLimit-Reset', Math.ceil(entry.resetAt / 1000));
+
+  if (entry.count > RATE_LIMIT_MAX) {
+    const retryAfterSeconds = Math.ceil((entry.resetAt - now) / 1000);
+    log('Rate limit exceeded', { ip, count: entry.count, limit: RATE_LIMIT_MAX });
+
+    res.status(429).json({
+      error: 'Too Many Requests',
+      message: `Rate limit exceeded. Maximum ${RATE_LIMIT_MAX} requests per minute allowed.`,
+      retryAfter: retryAfterSeconds
+    });
+    return;
+  }
+
+  next();
+}
+
+// Terapkan ke semua routes
+app.use(rateLimitMiddleware);
 
 // ==============================
 // LOAD BALANCER (ROUND ROBIN)
